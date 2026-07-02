@@ -1,0 +1,142 @@
+# объединим моделирование 599 и 607
+#607
+file_simulation = '/home/aivanova/TAIGA/taiga607_hillas_iact01_14_7fix_cb0.csv' # 607
+sim_hill_607 = pd.read_csv(file_simulation)
+file_sim = '/home/aivanova/TAIGA/taiga607_A_sums2' # 607
+sim_all_607 = pd.read_csv(
+    file_sim,
+    comment='#',          # Игнорировать строки, начинающиеся с #
+    sep=r'\s+',           # Разделитель — любой количество пробелов
+    header=None,          # Нет заголовка в файле
+    skiprows=2,           # Пропустить первые 2 строки (заголовки)
+    engine='python',
+    names=['A', 'xtet', 'ytet', 'dist', 'AI', 'N_b_f', 'col7', 'col8', 'col9', 'col10', 'E_sim']
+)
+sim_all_607 = sim_all_607.iloc[::5]
+#599
+file_simulation = '/home/aivanova/TAIGA/taiga599_hillas_iact01_14_7fix_cb0.csv' # 599
+sim_hill_599 = pd.read_csv(file_simulation)
+file_sim = '/home/aivanova/TAIGA/taiga599_A_sums2' # 599
+sim_all_599 = pd.read_csv(
+    file_sim,
+    comment='#',          # Игнорировать строки, начинающиеся с #
+    sep=r'\s+',           # Разделитель — любой количество пробелов
+    header=None,          # Нет заголовка в файле
+    skiprows=2,           # Пропустить первые 2 строки (заголовки)
+    engine='python',
+    names=['A', 'xtet', 'ytet', 'dist', 'AI', 'N_b_f', 'col7', 'col8', 'col9', 'col10', 'E_sim']
+)
+sim_all_599 = sim_all_599.iloc[::5]
+
+df_all = pd.concat([sim_all_599, sim_all_607], ignore_index=True)
+df_hill = pd.concat([sim_hill_599, sim_hill_607], ignore_index=True)
+
+def filter_data(df):
+    common_filters = (
+        (df['size'] > 120) &
+        (df['width[0]'] > 0.024) &
+        (df['width[0]'] < 0.068 * np.log10(df['size']) - 0.047) &
+        (df['length[0]'] < 0.145 * np.log10(df['size']))
+    )
+    
+    source_df = df[
+        common_filters &
+        (df['dist[1]'].between(0.36, 1.3))
+    ]
+    return source_df
+
+df_hill_sel = filter_data(df_hill)
+
+# Разбиваем с шагом 0.36°
+step = 0.36
+min_val, max_val = 0.36, 1.44  
+
+bins = np.arange(min_val, max_val + step, step)
+
+df_hill_sel['dist_group'] = pd.cut(df_hill_sel['dist[1]'], bins=bins)
+
+# Функция для фитирования
+def energy_fit(x, a, b):
+    return a + b * np.log10(x)
+
+# Вычисление коэффициентов для каждой группы
+coefficients = {}
+for group in df_hill_sel['dist_group'].unique():
+    group_data = df_hill_sel[df_hill_sel['dist_group'] == group]
+    # print(group_data)
+    popt, _ = curve_fit(energy_fit, group_data['size'], np.log10(group_data['energy']))
+    coefficients[group] = {'a': popt[0], 'b': popt[1]}
+
+# Восстановление энергии
+def reconstruct_energy(row):
+    coeff = coefficients[row['dist_group']]
+    return 10**(coeff['a'] + coeff['b'] * np.log10(row['size']))
+
+df_hill_sel['reconstructed_energy'] = df_hill_sel.apply(reconstruct_energy, axis=1)
+
+def reconstruct_energy_df(df, coefficients, dist_column='dist1', size_column='size'):
+    df = df.copy()
+    df['dist_group'] = pd.cut(df[dist_column], bins=bins)
+
+    def _reconstruct(row):
+        if pd.isna(row['dist_group']):
+            return np.nan
+        coeff = coefficients.get(row['dist_group'])
+        if coeff is None:
+            return np.nan
+        return 10 ** (coeff['a'] + coeff['b'] * np.log10(row[size_column]))
+
+    df['reconstructed_energy'] = df.apply(_reconstruct, axis=1)
+    return df
+
+background_config = {
+    'anti_source': 'bg1_dist',
+    'bg2': 'bg2_dist',
+    'bg3': 'bg3_dist',
+    'bg4': 'bg4_dist',
+    'bg5': 'bg5_dist',
+}
+
+background_dfs_bg = {
+    'anti_source': anti_source_processed.copy(),
+    'bg2': bg2_processed.copy(),
+    'bg3': bg3_processed.copy(),
+    'bg4': bg4_processed.copy(),
+    'bg5': bg5_processed.copy(),
+}
+
+exp_data_sg = reconstruct_energy_df(exp_data.copy(), coefficients, dist_column='dist1')
+
+for name, bg_df in background_dfs_bg.items():
+    dist_col = background_config[name]
+    background_dfs_bg[name] = reconstruct_energy_df(bg_df, coefficients, dist_column=dist_col)
+    print(f"{name}: {dist_col}, N={len(background_dfs_bg[name])}, NaN={background_dfs_bg[name]['reconstructed_energy'].isna().sum()}")
+
+plt.figure(figsize=(14, 8))
+plt.hist(exp_data_sg['reconstructed_energy'].dropna(),
+         bins=np.logspace(np.log10(0.1), np.log10(1000), 50),
+         log=True, alpha=0.7, label='Сигнал (dist1)')
+
+colors = ['red', 'green', 'blue', 'purple', 'orange']
+for (name, bg_df), color in zip(background_dfs_bg.items(), colors):
+    dist_col = background_config[name]
+    plt.hist(bg_df['reconstructed_energy'].dropna(),
+             bins=np.logspace(np.log10(0.1), np.log10(1000), 50),
+             log=True, alpha=0.5, histtype='step', linewidth=2,
+             label=f'{name} ({dist_col})', color=color)
+
+plt.xscale('log')
+plt.xlabel('Восстановленная энергия (ТэВ)', fontsize=14)
+plt.ylabel('Число событий', fontsize=14)
+plt.title('BG_POINTS_RECONSTRUCTION_V2: сигнал dist1, фон bg1..bg5_dist', fontsize=16)
+plt.legend(fontsize=11, bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.grid(True, which='both', linestyle='--', alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+exp_data = exp_data_sg
+anti_source_processed = background_dfs_bg['anti_source']
+bg2_processed = background_dfs_bg['bg2']
+bg3_processed = background_dfs_bg['bg3']
+bg4_processed = background_dfs_bg['bg4']
+bg5_processed = background_dfs_bg['bg5']
